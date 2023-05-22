@@ -1,8 +1,8 @@
 import torch
-from models import Encoder, MuSigmaEncoder, Decoder
+from neural_processes_dupont.models import Encoder, MuSigmaEncoder, Decoder
 from torch import nn
 from torch.distributions import Normal
-from utils import img_mask_to_np_input
+from neural_processes_dupont.utils import img_mask_to_np_input
 
 
 class NeuralProcess(nn.Module):
@@ -26,13 +26,14 @@ class NeuralProcess(nn.Module):
     h_dim : int
         Dimension of hidden layer in encoder and decoder.
     """
-    def __init__(self, x_dim, y_dim, r_dim, z_dim, h_dim):
+    def __init__(self, x_dim, y_dim, r_dim, z_dim, h_dim, device):
         super(NeuralProcess, self).__init__()
         self.x_dim = x_dim
         self.y_dim = y_dim
         self.r_dim = r_dim
         self.z_dim = z_dim
         self.h_dim = h_dim
+        self.device = device
 
         # Initialize networks
         self.xy_to_r = Encoder(x_dim, y_dim, h_dim, r_dim)
@@ -77,7 +78,7 @@ class NeuralProcess(nn.Module):
         # Return parameters of distribution
         return self.r_to_mu_sigma(r)
 
-    def forward(self, x_context, y_context, x_target, y_target=None):
+    def forward(self, x_target, y_target=None):
         """
         Given context pairs (x_context, y_context) and target points x_target,
         returns a distribution over target points y_target.
@@ -104,31 +105,40 @@ class NeuralProcess(nn.Module):
         shown to work best empirically.
         """
         # Infer quantities from tensor dimensions
-        batch_size, num_context, x_dim = x_context.size()
-        _, num_target, _ = x_target.size()
-        _, _, y_dim = y_context.size()
+        batch_size, num_target, x_dim = x_target.size()
+        _, _, y_dim = y_target.size()
 
+        # if self.training:
+        #     # Encode target and context (context needs to be encoded to
+        #     # calculate kl term)
+        #     mu_target, sigma_target = self.xy_to_mu_sigma(x_target, y_target)
+        #     mu_context, sigma_context = self.xy_to_mu_sigma(x_context, y_context)
+        #     # Sample from encoded distribution using reparameterization trick
+        #     q_target = Normal(mu_target, sigma_target)
+        #     q_context = Normal(mu_context, sigma_context)
+        #     z_sample = q_target.rsample()
+        #     # Get parameters of output distribution
+        #     y_pred_mu, y_pred_sigma = self.xz_to_y(x_target, z_sample)
+        #     p_y_pred = Normal(y_pred_mu, y_pred_sigma)
+
+        #     return p_y_pred, q_target, q_context
         if self.training:
-            # Encode target and context (context needs to be encoded to
-            # calculate kl term)
             mu_target, sigma_target = self.xy_to_mu_sigma(x_target, y_target)
-            mu_context, sigma_context = self.xy_to_mu_sigma(x_context, y_context)
-            # Sample from encoded distribution using reparameterization trick
             q_target = Normal(mu_target, sigma_target)
-            q_context = Normal(mu_context, sigma_context)
+            p_z = Normal(torch.zeros((batch_size, self.z_dim)).to(self.device), torch.ones((batch_size, self.z_dim)).to(self.device))
             z_sample = q_target.rsample()
-            # Get parameters of output distribution
             y_pred_mu, y_pred_sigma = self.xz_to_y(x_target, z_sample)
             p_y_pred = Normal(y_pred_mu, y_pred_sigma)
-
-            return p_y_pred, q_target, q_context
+            return p_y_pred, q_target, p_z
         else:
-            # At testing time, encode only context
-            mu_context, sigma_context = self.xy_to_mu_sigma(x_context, y_context)
-            # Sample from distribution based on context
-            q_context = Normal(mu_context, sigma_context)
-            z_sample = q_context.rsample()
-            # Predict target points based on context
+            # # At testing time, encode only context
+            # mu_context, sigma_context = self.xy_to_mu_sigma(x_context, y_context)
+            # # Sample from distribution based on context
+            # q_context = Normal(mu_context, sigma_context)
+            # z_sample = q_context.rsample()
+            p_z = Normal(torch.zeros((batch_size, self.z_dim)).to(self.device), torch.ones((batch_size, self.z_dim)).to(self.device))
+            z_sample = p_z.rsample()
+            # Predict target points
             y_pred_mu, y_pred_sigma = self.xz_to_y(x_target, z_sample)
             p_y_pred = Normal(y_pred_mu, y_pred_sigma)
 

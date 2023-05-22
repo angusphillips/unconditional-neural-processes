@@ -1,10 +1,11 @@
 import torch
 from random import randint
-from neural_process import NeuralProcessImg
+from neural_processes_dupont.neural_process import NeuralProcessImg
 from torch import nn
 from torch.distributions.kl import kl_divergence
-from utils import (context_target_split, batch_context_target_mask,
+from neural_processes_dupont.utils import (context_target_split, batch_context_target_mask,
                    img_mask_to_np_input)
+from tqdm import tqdm
 
 
 class NeuralProcessTrainer():
@@ -32,13 +33,13 @@ class NeuralProcessTrainer():
         Frequency with which to print loss information during training.
     """
     def __init__(self, device, neural_process, optimizer, num_context_range,
-                 num_extra_target_range, print_freq=100):
+                 num_extra_target_range, logger):
         self.device = device
         self.neural_process = neural_process
         self.optimizer = optimizer
         self.num_context_range = num_context_range
         self.num_extra_target_range = num_extra_target_range
-        self.print_freq = print_freq
+        self.logger = logger
 
         # Check if neural process is for images
         self.is_img = isinstance(self.neural_process, NeuralProcessImg)
@@ -56,14 +57,21 @@ class NeuralProcessTrainer():
         epochs : int
             Number of epochs to train for.
         """
-        for epoch in range(epochs):
+        epoch=0
+        t = tqdm(
+            range(epoch, epochs),
+            total=epochs - epoch,
+            bar_format="{desc}{bar}{r_bar}",
+            mininterval=1,
+        )
+        for e in t:
             epoch_loss = 0.
             for i, data in enumerate(data_loader):
                 self.optimizer.zero_grad()
 
                 # Sample number of context and target points
-                num_context = randint(*self.num_context_range)
-                num_extra_target = randint(*self.num_extra_target_range)
+                # num_context = randint(*self.num_context_range)
+                # num_extra_target = randint(*self.num_extra_target_range)
 
                 # Create context and target points and apply neural process
                 if self.is_img:
@@ -85,12 +93,12 @@ class NeuralProcessTrainer():
                     _, y_target = img_mask_to_np_input(img, target_mask)
                 else:
                     x, y = data
-                    x_context, y_context, x_target, y_target = \
-                        context_target_split(x, y, num_context, num_extra_target)
-                    p_y_pred, q_target, q_context = \
-                        self.neural_process(x_context, y_context, x_target, y_target)
+                    x = x.to(self.device)
+                    y = y.to(self.device)
+                    x_target, y_target = x, y
+                    p_y_pred, q_target, p_z = self.neural_process(x_target, y_target)
 
-                loss = self._loss(p_y_pred, y_target, q_target, q_context)
+                loss = self._loss(p_y_pred, y_target, q_target, p_z)
                 loss.backward()
                 self.optimizer.step()
 
@@ -98,13 +106,15 @@ class NeuralProcessTrainer():
 
                 self.steps += 1
 
-                if self.steps % self.print_freq == 0:
-                    print("iteration {}, loss {:.3f}".format(self.steps, loss.item()))
+                # if self.steps % self.print_freq == 0:
+                #     print("iteration {}, loss {:.3f}".format(self.steps, loss.item()))
 
-            print("Epoch: {}, Avg_loss: {}".format(epoch, epoch_loss / len(data_loader)))
             self.epoch_loss_history.append(epoch_loss / len(data_loader))
+            epoch=e
+            self.logger.log_metrics({"train/loss": epoch_loss/len(data_loader)}, e)
+            t.set_description(f"Loss: {epoch_loss/len(data_loader):.3f}")
 
-    def _loss(self, p_y_pred, y_target, q_target, q_context):
+    def _loss(self, p_y_pred, y_target, q_target, p_z):
         """
         Computes Neural Process loss.
 
@@ -127,5 +137,5 @@ class NeuralProcessTrainer():
         log_likelihood = p_y_pred.log_prob(y_target).mean(dim=0).sum()
         # KL has shape (batch_size, r_dim). Take mean over batch and sum over
         # r_dim (since r_dim is dimension of normal distribution)
-        kl = kl_divergence(q_target, q_context).mean(dim=0).sum()
+        kl = kl_divergence(q_target, p_z).mean(dim=0).sum()
         return -log_likelihood + kl

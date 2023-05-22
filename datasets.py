@@ -58,6 +58,88 @@ class SineData(Dataset):
     def __len__(self):
         return self.num_samples
 
+class QuadraticData(Dataset):
+    def __init__(self, num_samples, num_xvals, sigma, sigma_x):
+        self.name='quadratic'
+        self.num_samples = num_samples
+        self.num_xvals = num_xvals
+        self.sigma = sigma
+        self.sigma_x = sigma_x
+        self.xvals = np.linspace(-2*sigma_x, 2*sigma_x, num_xvals)
+        self.xmin = -2*sigma_x
+        self.xmax = 2*sigma_x
+        self.ymin = -5*sigma_x**2
+        self.ymax = 5*sigma_x**2
+
+    def __getitem__(self, index):
+        if type(index)==int:
+            sign = np.random.choice(np.array([-1,1]))
+            offset = self.sigma * np.random.normal()
+            sample_ = sign * self.xvals**2 + offset
+            sample_ = torch.from_numpy(np.expand_dims(sample_, -1)).float()
+            x_ = torch.from_numpy(np.expand_dims(self.xvals, -1)).float()
+            return (x_, sample_)
+        else:
+            ns = len(index)
+            samples=[]
+            for i in range(ns):
+                sign = np.random.choice(np.array([-1,1]))
+                offset = self.sigma * np.random.normal()
+                sample_ = sign * self.xvals**2 + offset
+                sample_ = torch.from_numpy(np.expand_dims(sample_, -1)).float()
+                x_ = torch.from_numpy(np.expand_dims(self.xvals, -1)).float()
+                samples.append((x_, sample_))
+            return samples
+
+    def __len__(self):
+        return self.num_samples
+    
+
+class CSVDataset(Dataset):
+    def __init__(self, file, name):
+        self.name=name
+        self.file = file
+        if name == 'melbourne':
+            self.xvals = np.arange(24)
+            self.num_xvals = 24
+            self.ymin = -2
+            self.ymax = 6
+        elif name == 'gridwatch':
+            self.xvals = np.linspace(0,24-1/288,288)
+            self.num_xvals = 288
+            self.ymin = -3
+            self.ymax = 3
+        elif name == 'quadratic':
+            self.ymin = -3
+            self.ymax = 3
+            self.num_xvals = 100
+            self.xvals = np.linspace(-10, 10, 100)
+        else:
+            NotImplementedError()
+
+        self.data = self.get_samples()
+
+    def get_samples(self):
+        if 'csv' in self.file:
+            data_ = np.genfromtxt(self.file, delimiter=',')
+        elif 'npy' in self.file:
+            data_ = np.load(self.file, allow_pickle=True)
+        if len(data_.shape) == 3:
+            data_ = data_[:,:,0]
+        self.num_samples = data_.shape[0]
+        samples = []
+        for j in range(data_.shape[0]):
+            x_ = torch.from_numpy(np.expand_dims(self.xvals, -1)).float()
+            sample_ = torch.from_numpy(np.expand_dims(data_[j], -1)).float()
+            samples.append((x_, sample_))
+        return samples
+
+    def __getitem__(self, index):
+        return self.data[index]
+
+    def __len__(self):
+        return self.num_samples
+
 
 def mnist(batch_size=16, size=28, path_to_data='../../mnist_data'):
     """MNIST dataloader.
