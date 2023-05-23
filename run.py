@@ -1,28 +1,23 @@
 import os
-from pickletools import read_long1
 import socket
 import logging
 import time
-
 from hydra.utils import instantiate
-
-
-from score_sde.utils.loggers_pl import LoggerCollection
-
+from logging.loggers_pl import LoggerCollection
 import torch
 import jax
 from torch.utils.data import DataLoader, random_split
 import torch.cuda as cuda
 import random
 import numpy as np
-import matplotlib.pyplot as plt
 from tqdm import trange
-
-from neural_processes_dupont.neural_process import NeuralProcess
-from neural_processes_dupont.training import NeuralProcessTrainer
-from neural_processes_dupont.datasets import QuadraticData
-from score_sde.utils.metrics import MetricsCollection
-from score_sde.utils.plotting import oned_samples
+from data.tensordataset import TensorDataset
+from sgm.utils import ModelWrapper
+from unconditional_neural_processes.neural_process import NeuralProcess
+from unconditional_neural_processes.training import NeuralProcessTrainer
+from unconditional_neural_processes.datasets import QuadraticData
+from evaluate.utils import MetricsCollection
+from evaluate.plotting import basic_plots
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +30,7 @@ def run(cfg):
     log.info(f"hostname: {socket.gethostname()}")
     ckpt_path = os.path.join(run_path, cfg.ckpt_dir)
     os.makedirs(ckpt_path, exist_ok=True)
+    model_file = os.path.join(ckpt_path, 'model.pt')
     loggers = [instantiate(logger_cfg) for logger_cfg in cfg.logger.values()]
     logger = LoggerCollection(loggers)
     # logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
@@ -49,13 +45,25 @@ def run(cfg):
     metrics = MetricsCollection(metrics)
 
     log.info("Stage : Instantiate dataset")
+    rng = jax.random.PRNGKey(cfg.seed)
+    rng, next_rng = jax.random.split(rng)
     dataset = instantiate(cfg.dataset)
 
-    if isinstance(dataset, QuadraticData):
-        train_ds, test_ds = dataset, dataset
+    if isinstance(dataset, TensorDataset):
+        # split and wrap dataset into dataloaders
+        train_ds, eval_ds, test_ds = random_split(
+            dataset, lengths=cfg.splits, seed=0
+        )
+        train_ds, eval_ds, test_ds = (
+            DataLoader(train_ds, batch_dims=cfg.batch_size, rng=next_rng, shuffle=True),
+            DataLoader(eval_ds, batch_dims=cfg.eval_batch_size, rng=next_rng),
+            DataLoader(test_ds, batch_dims=cfg.eval_batch_size, rng=next_rng),
+        )
+        log.info(
+            f"Train size: {len(train_ds.dataset)}. Val size: {len(eval_ds.dataset)}. Test size: {len(test_ds.dataset)}"
+        )
     else:
-        lengths = [round(p * dataset.num_samples) for p in cfg.splits]
-        train_ds, test_ds = random_split(dataset, lengths)
+        train_ds, eval_ds, test_ds = dataset, dataset, dataset
 
     log.info("Stage : Instantiate model")
     # Create NP model
@@ -63,7 +71,7 @@ def run(cfg):
 
     log.info("Stage : Instantiate trainer")
     # Dataloader
-    data_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
+    data_loader = train_ds
 
     # Optimiser
     optimizer = torch.optim.Adam(neuralprocess.parameters(), lr=cfg.lr)
@@ -74,61 +82,25 @@ def run(cfg):
                                     num_extra_target_range=None,
                                     logger=logger)
 
-    log.info("Stage : Training")
-    neuralprocess.training = True
-    t0 = time.time()
-    np_trainer.train(data_loader = data_loader, epochs=cfg.epochs)
-    t1 = time.time()
-    log.info('training time: ', t1-t0)
+    if cfg.resume or cfg.mode == "test":  # if resume or evaluate
+        neuralprocess.load_state_dict(torch.load(model_file, map_location=lambda storage, loc: storage))
 
-    log.info("Stage : Generate samples")
-    y0 = np.zeros((cfg.required_samples, dataset.num_xvals))
-    y = np.zeros((cfg.required_samples, dataset.num_xvals))
+    if cfg.mode == "train" or cfg.mode == "all":
+        log.info("Stage : Training")
+        neuralprocess.training = True
+        np_trainer.train(data_loader = data_loader, epochs=cfg.epochs)
+        torch.save(neuralprocess, model_file)
 
-    x = torch.from_numpy(np.expand_dims(np.expand_dims(dataset.xvals, 0), -1)).to(device)
-    for i in trange(cfg.required_samples):
-        idx = np.random.choice(len(test_ds))
-        _, y0_ = test_ds[idx]
-        z = torch.randn((1, cfg.z_dim)).to(device)
-        y_, _ = neuralprocess.xz_to_y(x.float(), z.float())
-        y0[i,:] = y0_.flatten().cpu().detach().numpy()
-        y[i,:] = y_.flatten().cpu().detach().numpy()
-
-    # Save samples
-    np.save(os.path.join(ckpt_path, 'x.npy'), x.cpu().detach().numpy())
-    np.save(os.path.join(ckpt_path, 'y.npy'), y)
-    np.save(os.path.join(ckpt_path, 'y0.npy'), y0)
-
-    # Plot
-    # log.info("Stage : Plotting")
-    # fig = oned_samples(None, dataset.xvals, y0, y, dataset, cfg.plotting.num_samples_vis, model_samples=True, dataset_samples=True)
-    # logger.log_plot('model_dataset_samples', fig, cfg.epochs)
-    # plt.close(fig)
-
-    # fig = oned_samples(None, dataset.xvals, y0, y, dataset, cfg.plotting.num_samples_vis, model_samples=False, dataset_samples=True)
-    # logger.log_plot('dataset_samples', fig, cfg.epochs)
-    # plt.close(fig)
-
-    # fig = oned_samples(None, dataset.xvals, y0, y, dataset, cfg.plotting.num_samples_vis, model_samples=True, dataset_samples=False)
-    # logger.log_plot('model_samples', fig, cfg.epochs)
-    # plt.close(fig)
-
-    log.info("Stage : Computing metric")
-    stage = 'test'
-    rng = jax.random.PRNGKey(cfg.seed)
-    for metric in metrics.metrics_list:
-        power, mmd2 = 0.0, 0.0
-        n_it = int(metric.n_tests/metric.batch)
-        nb = metric.batch*metric.n_samples
-        for i in trange(n_it):
-            rng, rng1 = jax.random.split(rng, num=2)
-
-            power_, mmd2_ = metric.power_test(y0[(i*nb):((i+1)*nb),:], y[(i*nb):((i+1)*nb),:], rng1)
-            power += power_/n_it
-            mmd2 += mmd2_/n_it
-
-        logger.log_metrics({f"{stage}/power_{metric.kernel_T}": power}, cfg.epochs)
-        log.info(f"{stage}/power_{metric.kernel_T} = {power:.3f}")
-
-        logger.log_metrics({f"{stage}/mmd2_{metric.kernel_T}": mmd2}, cfg.epochs)
-        log.info(f"{stage}/mmd2_{metric.kernel_T} = {mmd2:.5f}")
+    model_wrapper = ModelWrapper(model=neuralprocess, cfg=cfg, device=device)
+    
+    if cfg.mode == "test" or (cfg.mode == "all" and success):
+        log.info("Stage : Test")
+        if cfg.test_val:
+            metrics.get_and_log_metrics(model_wrapper, eval_ds, cfg, log, logger, "val", cfg.epochs)
+        if cfg.test_test:
+            metrics.get_and_log_metrics(model_wrapper, test_ds, cfg, log, logger, "test", cfg.epochs)
+        if cfg.test_plot:
+            basic_plots(model_wrapper, test_ds, cfg, logger, 'test', cfg.epochs)
+        success = True
+    logger.save()
+    logger.finalize("success" if success else "failure")

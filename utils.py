@@ -1,5 +1,24 @@
 import numpy as np
 import torch
+from utils.wrapper import AbstractModelWrapper
+import jax.numpy as jnp
+
+class ModelWrapper(AbstractModelWrapper):
+    def __init__(
+            self,
+            model,
+            cfg,
+            device
+    ):
+        self.device = device
+        self.cfg = cfg
+        self.model = model
+
+    def sample(self, rng, batch_shape, context):
+        x = torch.from_numpy(context[2]).to(self.device)
+        z = torch.randn((*batch_shape, self.cfg.z_dim)).to(self.device)
+        y, _ = self.model.xz_to_y(x.float(), z.float())
+        return y.cpu().detach().numpy()
 
 
 def context_target_split(x, y, num_context, num_extra_target):
